@@ -1,0 +1,323 @@
+---
+
+
+- name: Configurar CentralNode
+  hosts: localhost
+  become: yes
+  gather_facts: no
+
+
+  tasks:
+    - name: Habilitar PasswordAuthentication en SSH
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#*PasswordAuthentication'
+        line: 'PasswordAuthentication yes'
+
+
+    - name: Habilitar PermitRootLogin en SSH
+      ansible.builtin.lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#*PermitRootLogin'
+        line: 'PermitRootLogin yes'
+
+
+    - name: Reiniciar SSH
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
+
+- name: Despertar contenedores
+  hosts: localhost
+  gather_facts: no
+
+
+  tasks:
+    - name: Ping desde cada contenedor a su gateway
+      ansible.builtin.shell: |
+        ssh root@192.168.1.220 "pct exec {{ item.id }} -- ping -c 2 {{ item.gw }}"
+      with_items:
+        - { id: 203, gw: "10.0.30.1" }
+        - { id: 203, gw: "10.0.40.1" }
+      ignore_errors: yes
+
+
+    - name: Instalar git en CentralNode
+      ansible.builtin.apt:
+        name: git
+        state: present
+      become: yes
+
+
+    - name: Crear directorio del repositorio en CentralNode
+      ansible.builtin.file:
+        path: /root/git/iac-deployment-lab
+        state: directory
+        mode: '0755'
+      become: yes
+
+
+    - name: Clonar repositorio en CentralNode (necesario para backup.sql)
+      ansible.builtin.git:
+        repo: https://github.com/CuerdoG/wordpress-docker-proyecto.git
+        dest: /root/git/iac-deployment-lab/wordpress-docker-proyecto
+        force: no
+        update: no
+      become: yes
+      ignore_errors: yes
+
+
+# ============================================================
+# INSTALAR DOCKER EN TODAS LAS MAQUINAS
+# ============================================================
+- name: Instalar Docker
+  hosts: all,!bastion
+  become: yes
+  tasks:
+
+    - name: Instalar dependencias base
+      ansible.builtin.apt:
+        name:
+          - gnupg
+          - ca-certificates
+          - curl
+          - rsync
+        state: present
+        update_cache: yes
+
+    - name: Eliminar paquetes Docker conflictivos
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose
+          - docker-buildx
+          - containerd
+          - runc
+        state: absent
+        purge: yes
+      ignore_errors: yes
+
+    - name: Crear directorio para claves APT
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Descargar clave GPG de Docker
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/debian/gpg
+        dest: /etc/apt/keyrings/docker.gpg
+        mode: '0644'
+
+    - name: Añadir repositorio de Docker
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable"
+        state: present
+
+    - name: Instalar Docker CE y Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Arrancar y habilitar Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+
+# ============================================================
+# DESPLEGAR MARIADB
+# ============================================================
+- name: Desplegar MariaDB
+  hosts: mariadb
+  become: yes
+  tasks:
+
+    - name: Parar contenedores y eliminar volumenes previos
+      ansible.builtin.shell: docker compose down -v
+      args:
+        chdir: /opt/databases
+      ignore_errors: yes
+
+    - name: Eliminar wp-db-data para forzar reimportacion del backup
+      ansible.builtin.file:
+        path: /opt/databases/wp-db-data
+        state: absent
+
+    - name: Crear directorios
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/databases
+        - /opt/databases/wp-db-data
+
+    - name: Copiar backup.sql
+      ansible.builtin.copy:
+        src: /root/git/iac-deployment-lab/wordpress-docker-proyecto/backup.sql
+        dest: /opt/databases/backup.sql
+        mode: '0644'
+
+    - name: Eliminar zabbix-agent del sistema y contenedor huerfano (CT MariaDB)
+      ansible.builtin.shell: |
+        systemctl stop zabbix-agent2 2>/dev/null || true
+        systemctl stop zabbix-agent 2>/dev/null || true
+        systemctl disable zabbix-agent2 2>/dev/null || true
+        systemctl disable zabbix-agent 2>/dev/null || true
+        pkill -x zabbix_agent2 2>/dev/null || true
+        sleep 1
+        docker rm -f zabbix-agent 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Escribir docker-compose.yml de MariaDB
+      ansible.builtin.copy:
+        dest: /opt/databases/docker-compose.yml
+        content: |
+          services:
+            wp_db:
+              image: mariadb:10.11
+              container_name: wp_db
+              restart: always
+              ports:
+                - "3306:3306"
+              environment:
+                MYSQL_DATABASE: wordpress
+                MYSQL_USER: wpuser
+                MYSQL_PASSWORD: wppass
+                MYSQL_ROOT_PASSWORD: rootpass
+              volumes:
+                - ./wp-db-data:/var/lib/mysql
+                - ./backup.sql:/docker-entrypoint-initdb.d/backup.sql
+
+
+    - name: Levantar MariaDB
+      ansible.builtin.shell: docker compose up -d
+      args:
+        chdir: /opt/databases
+
+    - name: Esperar a que MariaDB arranque
+      ansible.builtin.wait_for:
+        timeout: 30
+
+    - name: Dar permisos a wpuser desde cualquier host
+      ansible.builtin.shell: >
+        docker exec wp_db mysql -u root -prootpass -e
+        "GRANT ALL ON wordpress.* TO 'wpuser'@'%' IDENTIFIED BY 'wppass'; FLUSH PRIVILEGES;"
+      ignore_errors: yes
+
+# ============================================================
+# DESPLEGAR WORDPRESS
+# ============================================================
+- name: Desplegar WordPress
+  hosts: wordpress
+  become: yes
+  tasks:
+
+    - name: Instalar git
+      ansible.builtin.apt:
+        name: git
+        state: present
+
+    - name: Parar contenedores previos
+      ansible.builtin.shell: docker compose down --remove-orphans
+      args:
+        chdir: /opt/wordpress
+      ignore_errors: yes
+
+    - name: Borrar directorio WordPress para clonar limpio
+      ansible.builtin.file:
+        path: /opt/wordpress
+        state: absent
+
+    - name: Clonar repositorio
+      ansible.builtin.git:
+        repo: https://github.com/CuerdoG/wordpress-docker-proyecto.git
+        dest: /opt/wordpress
+        force: yes
+
+    - name: Crear directorio wp-data con permisos www-data
+      ansible.builtin.file:
+        path: /opt/wordpress/wp-data
+        state: directory
+        owner: '33'
+        group: '33'
+        mode: '0775'
+        recurse: yes
+
+    - name: Eliminar zabbix-agent del sistema y contenedor huerfano (CT WordPress)
+      ansible.builtin.shell: |
+        systemctl stop zabbix-agent2 2>/dev/null || true
+        systemctl stop zabbix-agent 2>/dev/null || true
+        systemctl disable zabbix-agent2 2>/dev/null || true
+        systemctl disable zabbix-agent 2>/dev/null || true
+        pkill -x zabbix_agent2 2>/dev/null || true
+        sleep 1
+        docker rm -f zabbix-agent 2>/dev/null || true
+      ignore_errors: yes
+
+    - name: Escribir docker-compose.yml de WordPress
+      ansible.builtin.copy:
+        dest: /opt/wordpress/docker-compose.yml
+        content: |
+          services:
+            wordpress:
+              image: wordpress:php8.2-apache
+              container_name: wp_web
+              restart: always
+              ports:
+                - "80:80"
+              environment:
+                WORDPRESS_DB_HOST: 10.0.40.203:3306
+                WORDPRESS_DB_USER: wpuser
+                WORDPRESS_DB_PASSWORD: wppass
+                WORDPRESS_DB_NAME: wordpress
+                WORDPRESS_CONFIG_EXTRA: |
+                  $$table_prefix = 'inmo_';
+                  define('WP_HOME', 'https://zitadel.a24iriabc.iesteis.gal');
+                  define('WP_SITEURL', 'https://zitadel.a24iriabc.iesteis.gal');
+                  if (isset($$_SERVER['HTTP_X_FORWARDED_PROTO']) && $$_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https') {
+                      $$_SERVER['HTTPS'] = 'on';
+                  }
+              volumes:
+                - ./wp-data:/var/www/html
+
+
+            zabbix-agent:
+              image: zabbix/zabbix-agent2:alpine-7.0-latest
+              container_name: zabbix-agent
+              restart: always
+              network_mode: host
+              privileged: true
+              environment:
+                ZBX_HOSTNAME: "CT_wordpress"
+                ZBX_SERVER_HOST: "192.168.1.231"
+                ZBX_SERVER_PORT: "10051"
+                ZBX_PASSIVE_ALLOW: "true"
+                ZBX_ACTIVE_ALLOW: "true"
+              volumes:
+                - /proc:/proc:ro
+                - /sys:/sys:ro
+                - /var/run/docker.sock:/var/run/docker.sock:ro
+
+
+    - name: Levantar WordPress
+      ansible.builtin.shell: docker compose up -d --force-recreate
+      args:
+        chdir: /opt/wordpress
+
+    - name: Esperar a que WordPress arranque
+      ansible.builtin.wait_for:
+        port: 80
+        host: 127.0.0.1
+        timeout: 60
+
+    - name: Activar modulos Apache necesarios
+      ansible.builtin.shell: |
+        docker exec wp_web a2enmod rewrite headers
+        docker exec wp_web apache2ctl graceful

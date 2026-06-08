@@ -1,0 +1,17 @@
+# Terraform - estado e información sensible
+*.tfstate
+*.tfstate.backup
+*.tfstate.*.backup
+.terraform/
+.terraform.lock.hcl
+
+# Variables con credenciales
+*.tfvars
+*.tfvars.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Ansible - archivos temporales
+*.retry

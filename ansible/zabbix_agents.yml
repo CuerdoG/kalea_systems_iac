@@ -1,0 +1,178 @@
+---
+# Despliega zabbix-agent2 en TODOS los nodos y los registra en Zabbix
+# Uso: ansible-playbook -i inventario.ini zabbix_agents.yml
+
+# ============================================================
+# PLAY 1: Instalar Docker en CentralNode si no lo tiene
+# ============================================================
+- name: Instalar Docker en CentralNode
+  hosts: localhost
+  become: yes
+  gather_facts: no
+
+  tasks:
+    - name: Comprobar si Docker esta instalado
+      ansible.builtin.shell: docker --version
+      register: docker_check
+      ignore_errors: yes
+
+    - name: Instalar dependencias base
+      ansible.builtin.apt:
+        name: [apt-transport-https, ca-certificates, curl, gnupg]
+        state: present
+        update_cache: yes
+      when: docker_check.rc != 0
+
+    - name: Crear directorio para claves APT
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+      when: docker_check.rc != 0
+
+    - name: Descargar clave GPG de Docker
+      ansible.builtin.shell: |
+        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+      when: docker_check.rc != 0
+
+    - name: Anadir repositorio Docker
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable"
+        state: present
+      when: docker_check.rc != 0
+
+    - name: Instalar Docker CE
+      ansible.builtin.apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin]
+        state: present
+        update_cache: yes
+      when: docker_check.rc != 0
+
+    - name: Arrancar y habilitar Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: yes
+      when: docker_check.rc != 0
+
+# ============================================================
+# PLAY 2: Agente en nodos normales (todos menos CT Zabbix)
+# ============================================================
+- name: Desplegar Zabbix Agent (nodos estandar)
+  hosts: all,localhost
+  become: yes
+
+  vars:
+    zabbix_server: "192.168.1.231"
+    zabbix_server_port: "10051"
+    zabbix_image: "zabbix/zabbix-agent2:alpine-7.0-latest"
+
+  tasks:
+    - name: Eliminar contenedor zabbix-agent previo
+      ansible.builtin.shell: docker rm -f zabbix-agent 2>/dev/null || true
+
+    - name: Desplegar zabbix-agent2
+      ansible.builtin.shell: |
+        docker run -d \
+          --name zabbix-agent \
+          --restart always \
+          --network host \
+          --privileged \
+          -e ZBX_HOSTNAME="{{ ansible_hostname }}" \
+          -e ZBX_SERVER_HOST="{{ zabbix_server }}" \
+          -e ZBX_SERVER_PORT="{{ zabbix_server_port }}" \
+          -e ZBX_PASSIVE_ALLOW="true" \
+          -e ZBX_ACTIVE_ALLOW="true" \
+          -v /proc:/proc:ro \
+          -v /sys:/sys:ro \
+          -v /var/run/docker.sock:/var/run/docker.sock:ro \
+          {{ zabbix_image }}
+
+    - name: Verificar que el agente esta corriendo
+      ansible.builtin.shell: docker ps --filter name=zabbix-agent
+      register: agent_status
+
+    - name: Mostrar estado
+      ansible.builtin.debug:
+        msg: "{{ ansible_hostname }}: {{ agent_status.stdout_lines | join(', ') }}"
+
+# ============================================================
+# PLAY 4: Registrar todos los hosts en Zabbix via API
+# ============================================================
+- name: Registrar hosts en Zabbix
+  hosts: localhost
+  become: no
+  gather_facts: no
+
+  tasks:
+    - name: Registrar hosts via API de Zabbix
+      ansible.builtin.shell: |
+        python3 << 'PYEOF'
+        import json, urllib.request, time, sys
+
+        ZABBIX_URL = "http://192.168.1.231:8080/api_jsonrpc.php"
+        HDR = {"Content-Type": "application/json"}
+
+        HOSTS = [
+            {"hostname": "CentralNode",  "name": "CentralNode",   "ip": "10.0.10.200"},
+            {"hostname": "wordpress",    "name": "CT WordPress",   "ip": "10.0.30.203"},
+            {"hostname": "mariadb",      "name": "CT MariaDB",     "ip": "10.0.40.203"},
+        ]
+
+        def zapi(method, params, token=None):
+            data = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
+            if token:
+                data["auth"] = token
+            req = urllib.request.Request(ZABBIX_URL, json.dumps(data).encode(), HDR)
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return json.loads(r.read())
+
+        for i in range(6):
+            try:
+                token = zapi("user.login", {"username": "Admin", "password": "zabbix"})["result"]
+                break
+            except Exception as e:
+                time.sleep(10)
+        else:
+            print("ERROR: API no disponible"); sys.exit(1)
+
+        print("[OK] Login en Zabbix API")
+
+        groups = {g["name"]: g["groupid"] for g in
+                  zapi("hostgroup.get", {"output": ["groupid","name"]}, token)["result"]}
+        if "Linux servers" not in groups:
+            groups["Linux servers"] = zapi("hostgroup.create", {"name": "Linux servers"}, token)["result"]["groupids"][0]
+        gid = groups["Linux servers"]
+
+        templates = {t["name"]: t["templateid"] for t in
+                     zapi("template.get", {"output": ["templateid","name"]}, token)["result"]}
+        tmpl_id = next((templates[n] for n in [
+            "Linux by Zabbix agent active", "Linux by Zabbix agent"
+        ] if n in templates), None)
+
+        existing = {h["host"]: h["hostid"] for h in
+                    zapi("host.get", {"output": ["host","hostid"]}, token)["result"]}
+
+        for h in HOSTS:
+            params = {
+                "host": h["hostname"], "name": h["name"],
+                "groups": [{"groupid": gid}],
+                "interfaces": [{"type":1,"main":1,"useip":1,"ip":h["ip"],"dns":"","port":"10050"}],
+            }
+            if tmpl_id:
+                params["templates"] = [{"templateid": tmpl_id}]
+            if h["hostname"] in existing:
+                params["hostid"] = existing[h["hostname"]]
+                zapi("host.update", params, token)
+                print(f"  [UPDATE] {h['name']}")
+            else:
+                zapi("host.create", params, token)
+                print(f"  [CREATE] {h['name']}")
+
+        print("[OK] Todos los hosts registrados en Zabbix")
+        PYEOF
+      register: api_result
+
+    - name: Mostrar resultado
+      ansible.builtin.debug:
+        msg: "{{ api_result.stdout_lines }}"
